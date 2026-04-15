@@ -10,6 +10,9 @@
 | `permission_state_change_callback.h not found` | fuzztest include | 添加 access_token/src 到 include_dirs |
 | `hisysevent not found` | 组件未配置 | 在 config.json 添加 hiviewdfx/hisysevent |
 | `GN phase failed` | 依赖缺失 | 添加缺失组件或检查循环依赖 |
+| `cannot satisfy dependencies so 'std' only shows up once` | Rust 库格式冲突 | 见 rust-knowledge.md |
+| `find subsystem device_arm_virt failed` | board 名称不匹配 | 将 config.json 中 board 改为 `arm_virt` |
+| `find component product_qemu-arm64-linux-min failed` | 缺少 product 子系统 | 创建 ohos.build 和 BUILD.gn |
 
 ---
 
@@ -123,7 +126,128 @@ done
 
 ---
 
-## 5. 产品配置文件
+## 5. Product 子系统缺失 (ohos.build / BUILD.gn)
+
+### 错误信息
+```
+find subsystem device_arm_virt failed, please check it in out/preloader/qemu-arm64-linux-min/parts.json
+find component product_qemu-arm64-linux-min failed, please check it in out/preloader/qemu-arm64-linux-min/parts.json
+```
+
+### 根因
+构建系统需要两个文件来注册 product 子系统：
+
+| 文件 | 作用 | 缺失后果 |
+|------|------|---------|
+| `ohos.build` | 声明 subsystem 和 parts 映射 | subsystem 无法被注册，校验失败 |
+| `BUILD.gn` | 定义 GN 构建目标 | module_list 引用的目标不存在 |
+
+### 缺失文件示例
+```
+vendor/ohemu/qemu_arm64_linux_min/
+├── config.json      ✅ 存在
+├── ohos.build       ❌ 缺失
+└── BUILD.gn        ❌ 缺失
+```
+
+### 解决方案
+
+1. 创建缺失的 `ohos.build`:
+```json
+{
+  "parts": {
+    "product_qemu-arm64-linux-min": {
+      "module_list": [
+        "//vendor/ohemu/qemu_arm64_linux_min:qemu_arm64_linux_min"
+      ]
+    }
+  },
+  "subsystem": "product_qemu-arm64-linux-min"
+}
+```
+
+2. 创建缺失的 `BUILD.gn`:
+```gn
+group("qemu_arm64_linux_min") {
+}
+```
+
+3. 确认白名单中有对应条目 (`build/subsystem_compoents_whitelist.json`):
+```json
+"device_arm_virt": "device_arm_virt",
+"product_qemu-arm64-linux-min": "product_qemu-arm64-linux-min"
+```
+
+### Subsystem 名称不匹配警告
+
+```
+warning: subsystem name config incorrect in 'device/qemu/arm_virt/linux/ohos.build',
+build file subsystem name is device_arm_virt, configured subsystem name is device_qemu-arm-linux.
+```
+
+**根因**: `config.json` 中 `board` 字段是 `qemu-arm-linux`，构建系统会生成期望名称 `device_qemu-arm-linux`，但实际 ohos.build 中写的是 `device_arm_virt`。
+
+**解决方案**:
+
+| 方案 | 修改位置 | 说明 |
+|------|---------|------|
+| 方案A | `config.json` 中 `board` 改为 `arm_virt` | ✅ 推荐，与 ohos.build 一致 |
+| 方案B | 修改 `ohos.build` 中的 subsystem 名为 `device_qemu-arm-linux` | 需同步修改白名单 |
+| 方案C | 忽略警告 | 仅当 parts.json 能正确生成时才可忽略 |
+
+**方案A 示例**:
+```json
+// vendor/ohemu/qemu_arm64_linux_min/config.json
+{
+  "board": "arm_virt",  // 从 "qemu-arm-linux" 改为 "arm_virt"
+  ...
+}
+```
+
+---
+
+## 6. QEMU 启动问题
+
+### 启动卡在 init 阶段
+
+**症状**: 构建完成后，QEMU 启动卡在 init 阶段，无法进入 shell。
+
+**原因**: OpenHarmony 标准系统使用特殊的分区挂载机制，需要通过内核参数指定分区挂载信息。
+
+**解决方案**: 参考 `vendor/ohemu/qemu_arm64_linux_min/qemu_run.sh`
+
+关键启动参数：
+```bash
+kernel_bootargs="console=ttyAMA0 init=/bin/init hardware=qemu.arm.linux root=/dev/ram0 rw \
+ohos.required_mount.system=/dev/block/vdb@/usr@ext4@ro,barrier=1@wait,required \
+ohos.required_mount.vendor=/dev/block/vdc@/vendor@ext4@ro,barrier=1@wait,required"
+```
+
+**分区挂载参数格式**:
+```
+ohos.required_mount.<挂载点>=<设备路径>@<挂载目录>@<文件系统类型>@<挂载选项>@<等待策略>,required
+```
+
+### 控制台无输出
+
+**解决方案**: 添加 `earlycon` 参数启用早期控制台：
+```bash
+-append "console=ttyAMA0,115200 earlycon ..."
+```
+
+### QEMU 驱动配置
+
+```bash
+# 正确：使用 virtio-blk-device
+-drive if=none,file=system.img,format=raw,id=system,index=1 -device virtio-blk-device,drive=system
+
+# 错误：使用 virtio-blk-pci
+-drive file=system.img,format=qcow2,if=virtio
+```
+
+---
+
+## 7. 产品配置文件
 
 ### 路径
 `vendor/ohemu/qemu_arm64_linux_min/config.json`
@@ -135,7 +259,7 @@ done
   "type": "standard",
   "version": "3.0",
   "device_company": "qemu",
-  "board": "qemu-arm-linux",
+  "board": "arm_virt",
   "target_cpu": "arm64",
   "target_os": "ohos",
   "enable_ramdisk": true,
@@ -165,7 +289,7 @@ done
 
 ---
 
-## 6. 构建命令
+## 8. 构建命令
 
 ### 标准构建流程
 ```bash
@@ -194,7 +318,7 @@ hb build --gn-only
 
 ---
 
-## 7. 构建产物
+## 9. 构建产物
 
 ```
 out/qemu-arm-linux/packages/phone/images/

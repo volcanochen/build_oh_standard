@@ -1,5 +1,18 @@
 # OpenHarmony QEMU ARM64 依赖关系图
 
+## 组件风险等级速查
+
+| 等级 | 组件 | 说明 |
+|------|------|------|
+| 🔴 高 | huks | 25+ 间接依赖，QEMU ARM64 不可用，**建议默认禁用** |
+| 🟡 中 | access_token | 6 直接依赖 |
+| 🟡 中 | dsoftbus | 5 直接依赖 |
+| 🟢 低 | samgr, safwk | 通常可用 |
+| 🟢 低 | eventhandler | 通常可用 |
+| 🟢 低 | hilog, hisysevent | 通常可用 |
+
+---
+
 ## 产品配置组件
 
 ```
