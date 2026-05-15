@@ -24,6 +24,8 @@
 | `format specifies type.*but the argument has type` | - | benchmark/fuzztest 格式错误 | 移除测试或修复格式字符串 |
 | `lnn_net_builder_mock_test.cpp` | - | dsoftbus 测试编译错误 | 移除 dsoftbus 组件 |
 | `collections.Mapping` | - | Python 3.10+ 兼容性问题 | 见本节第11条 |
+| `41896 个任务` vs `835 个任务` | - | 增量编译未生效 | 见本节第12条 |
+| `hb set` 后全量重编 | - | preloader/GN gen 触发重编 | 使用 `--fast-rebuild` |
 
 ---
 
@@ -661,4 +663,277 @@ out/qemu-arm-linux/packages/phone/images/
 ├── userdata.img  100M    用户数据
 ├── eng_system.img 12M    工程测试镜像
 └── updater.img    6.9M   更新镜像
+```
+
+---
+
+## 11. Python 3.10+ 兼容性问题 (collections.Mapping)
+
+### 错误信息
+```
+ImportError: cannot import name 'Mapping' from 'collections'
+```
+或
+```
+ModuleNotFoundError: No module named 'prompt_toolkit'
+```
+
+### 根因
+在 Python 3.10+ 中，`collections.Mapping` 被移除，需要从 `collections.abc.Mapping` 导入。OpenHarmony 构建系统使用的 `prompt_toolkit==1.0.14` 版本过旧，不兼容 Python 3.10+。
+
+### 受影响组件
+- `build/hb/main.py` (hb 工具)
+- `prompt_toolkit==1.0.14`
+- `prebuilts/python/linux-x86/3.10.2/` (预编译 Python 3.10)
+
+### 解决方案
+
+**方案 A**: 使用 Docker 容器内的 Python 3.8（推荐）
+```bash
+# 容器内已安装 Python 3.8，使用 pip3 安装 prompt_toolkit
+docker run -it -v $(pwd):/home/openharmony swr.cn-south-1.myhuaweicloud.com/openharmony-docker/docker_oh_standard:3.2 \
+  bash -c "pip3 install prompt_toolkit==1.0.14 && cd /home/openharmony && PYTHONPATH=/home/openharmony/build/hb python3 build/hb/main.py build -p qemu-arm64-linux-min"
+```
+
+**方案 B**: 避免使用 prebuilts 中的 Python 3.10
+```bash
+# 设置 PATH 优先使用系统 Python 3.8
+export PATH=/usr/bin:$PATH
+python3 --version  # 确认为 3.8.x
+```
+
+### 验证 Python 版本
+```bash
+# Docker 内检查
+docker run --rm swr.cn-south-1.myhuaweicloud.com/openharmony-docker/docker_oh_standard:3.2 python3 --version
+# 输出: Python 3.8.10
+
+# prebuilts Python 版本（不兼容）
+/path/to/prebuilts/python/linux-x86/3.10.2/bin/python3 --version
+# 输出: Python 3.10.x (有 collections.Mapping 问题)
+```
+
+### 注意事项
+- **不要使用** `prebuilts/python/linux-x86/3.10.2/` 中的 Python，该版本与 prompt_toolkit 1.0.14 不兼容
+- **优先使用** Docker 镜像自带的 Python 3.8
+- 如果必须使用 Python 3.10+，需要升级相关 Python 包的版本
+
+---
+
+## 12. 增量编译问题
+
+### 症状
+
+**场景 1**: 构建任务数量异常
+```
+# 正常增量编译 (复用 .o 文件)
+[1/970] COPY ...
+[835/835] STAMP obj/build/core/gn/images.stamp
+
+# 异常全量重编 (未复用 .o 文件)
+[1/41896] CC obj/base/startup/init/services/param/base/parameterbase/param_trie.o
+[16/41896] CC obj/base/startup/init/services/param/base/parameterbase/param_trie.o
+...
+```
+
+**场景 2**: 每次 `hb build` 都重新编译所有模块
+```bash
+# 第一次构建
+hb set --product-name rk3568 && hb build  # 41896 个任务
+
+# 第二次构建 (期望增量，实际全量)
+hb set --product-name rk3568 && hb build  # 又是 41896 个任务！
+```
+
+### 根因分析
+
+#### 原因 1: `hb build` 默认执行完整流程
+
+`hb build` 默认会执行以下完整流程：
+
+```
+preloader → loader → GN gen → ninja
+```
+
+每次运行都会：
+1. **preloader**: 重新生成 `out/preloader/{product}/` 下的配置文件
+2. **GN gen**: 重新生成 ninja 构建图
+3. **ninja**: 检测到构建图变化，认为目标需要重编
+
+**代码证据** ([build/hb/modules/ohos_build_module.py](file:///home/volcano/myws/phr_4.0/build/hb/modules/ohos_build_module.py)):
+```python
+def _preload(self):
+    if not self.args_dict.get('fast_rebuild').arg_value:
+        self.preloader.run()  # 每次都运行！
+
+def _load(self):
+    if not self.args_dict.get('fast_rebuild').arg_value:
+        self.loader.run()  # 每次都运行！
+
+def _target_generate(self):
+    if not self.args_dict.get('fast_rebuild').arg_value:
+        self.target_generator.run()  # GN gen，每次都运行！
+```
+
+#### 原因 2: `hb set` 更新配置
+
+每次 `hb set --product-name rk3568` 都会更新 `ohos_config.json`：
+- 更新 product、board、kernel 等配置
+- 可能触发 preloader 重新生成配置
+- 导致 GN gen 认为构建图需要更新
+
+#### 原因 3: Docker 容器未持久化 out 目录
+
+如果 Docker 容器每次都重新创建，`out/` 目录会丢失：
+```bash
+# 错误示例: 每次都新建容器
+docker run --rm ...  # --rm 会删除容器，out 目录丢失！
+
+# 正确示例: 挂载 out 目录到宿主机
+docker run -v $(pwd)/out:/workspace/out ...
+```
+
+### 解决方案
+
+#### 方案 1: 使用 `--fast-rebuild` 跳过 preloader 和 GN gen ⭐推荐
+
+```bash
+# 第一次构建 (完整流程)
+hb set --product-name rk3568
+hb build --load-test-config false
+
+# 后续增量构建 (跳过 preloader 和 GN gen)
+hb build --fast-rebuild --load-test-config false
+```
+
+**效果对比**:
+
+| 构建方式 | preloader | GN gen | ninja | 时间 |
+|---------|-----------|--------|-------|------|
+| `hb build` | ✅ 运行 | ✅ 运行 | ✅ 运行 | ~17 分钟 |
+| `hb build --fast-rebuild` | ❌ 跳过 | ❌ 跳过 | ✅ 增量 | ~1-5 分钟 |
+
+#### 方案 2: 只运行一次 `hb set`
+
+```bash
+# 只需要设置一次
+hb set --product-name rk3568
+
+# 后续直接 build (如果配置没变)
+hb build --load-test-config false
+hb build --load-test-config false  # 第二次应该能增量
+```
+
+#### 方案 3: 直接使用 ninja 增量编译
+
+```bash
+# 进入 out 目录，直接运行 ninja
+cd out/rk3568
+ninja
+
+# 或者指定目标
+ninja <target_name>
+```
+
+#### 方案 4: 确保 Docker 持久化 out 目录
+
+```bash
+# 方式 1: 挂载整个工作目录 (推荐)
+docker run -v $(pwd):/workspace ...
+
+# 方式 2: 单独挂载 out 目录
+docker run -v $(pwd)/out:/workspace/out ...
+
+# 避免: 使用 --rm 删除容器
+docker run --rm ...  # ❌ 容器删除后 out 目录丢失
+```
+
+### 如何判断是否增量编译
+
+#### 方法 1: 检查构建日志中的任务数量
+
+```bash
+# 增量编译 (任务数少)
+[1/970] ...
+[835/835] STAMP ...
+
+# 全量编译 (任务数多)
+[1/41896] ...
+```
+
+#### 方法 2: 检查是否有 CC/CXX 编译命令
+
+```bash
+# 增量编译: 只有 STAMP、ACTION、COPY
+grep -E "^\[.*\] (CXX|CC|AR|SOLINK) " build.log
+# 输出为空
+
+# 全量编译: 有大量 CC/CXX 编译
+grep -E "^\[.*\] (CXX|CC|AR|SOLINK) " build.log | wc -l
+# 输出: 数千行
+```
+
+#### 方法 3: 检查 .o 文件时间戳
+
+```bash
+# 查看最近修改的 .o 文件
+find out/rk3568 -name "*.o" -mtime -1 | head
+
+# 如果输出为空，说明没有重新编译
+```
+
+### 常见问题
+
+#### Q1: 为什么 `--fast-rebuild` 后还是全量编译？
+
+**可能原因**:
+1. `out/` 目录被清理过
+2. Docker 容器重建，`out/` 目录丢失
+3. 源码有修改，ninja 检测到需要重编
+
+**检查方法**:
+```bash
+# 检查 out 目录是否存在
+ls -la out/rk3568/obj/
+
+# 检查 .o 文件是否存在
+find out/rk3568 -name "*.o" | wc -l
+```
+
+#### Q2: 什么时候需要重新运行 `hb set`？
+
+**需要重新运行**:
+- 切换产品 (`rk3568` → `qemu-arm64-linux-min`)
+- 修改 `config.json` 配置
+- 更新源码后首次构建
+
+**不需要重新运行**:
+- 修改源码后增量编译
+- 只修改某个模块的代码
+
+#### Q3: `--fast-rebuild` 有什么风险？
+
+**风险**: 如果 GN 相关脚本有变化（如 BUILD.gn 修改），跳过 GN gen 可能导致构建失败。
+
+**建议**:
+- 修改 BUILD.gn 后，不要使用 `--fast-rebuild`
+- 只在纯代码修改时使用 `--fast-rebuild`
+
+### 最佳实践
+
+```bash
+# 完整构建流程
+# 1. 首次构建或切换产品
+hb set --product-name rk3568
+hb build --load-test-config false
+
+# 2. 后续增量构建 (纯代码修改)
+hb build --fast-rebuild --load-test-config false
+
+# 3. 修改 BUILD.gn 后
+hb build --load-test-config false  # 不使用 --fast-rebuild
+
+# 4. 清理后重新构建
+rm -rf out/rk3568
+hb build --load-test-config false
 ```
